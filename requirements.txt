@@ -1,1 +1,11 @@
 streamlit
+openai
+tiktoken
+python-dotenv
+pandas
+Selenium
+bs4
+webdriver-manager
+matplotlib
+numpy
+plotly
