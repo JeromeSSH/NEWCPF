@@ -1,101 +1,31 @@
-# Enhanced Streamlit Script
 import os
 import json
 import requests
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
-import tiktoken
+from crewai import Agent, Task, Crew
+from crewai_tools import WebsiteSearchTool
+from bs4 import BeautifulSoup
 
-# Load environment variables from .env file if it exists
+# Load environment variables
 load_dotenv()
 
 # Initialize OpenAI client with flexible secret management
 def get_openai_api_key():
-    # Try to get API key from Streamlit secrets first
-    try:
-        return st.secrets["OPENAI_API_KEY"]
-    except Exception:
-        # Fall back to environment variable
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            st.error("No OpenAI API key found. Please set it in .streamlit/secrets.toml or as an environment variable.")
-            st.stop()
-        return api_key
+    api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        st.error("No OpenAI API key found. Please set it in .streamlit/secrets.toml or as an environment variable.")
+        st.stop()
+    return api_key
 
 # Initialize the OpenAI client
 client = OpenAI(api_key=get_openai_api_key())
 
-# Initialize OpenAI client with Streamlit secrets
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# Helper function to get embeddings
-def get_embedding(input_text, model='text-embedding-3-small'):
-    try:
-        response = client.embeddings.create(
-            input=input_text,
-            model=model
-        )
-        return [x.embedding for x in response.data]
-    except Exception as e:
-        st.error(f"Error getting embeddings: {str(e)}")
-        return None
-
-# Function to generate completion from OpenAI
-def get_completion(prompt, model="gpt-4", temperature=0, top_p=1.0, max_tokens=1024, json_output=False):
-    try:
-        output_json_structure = {"type": "json_object"} if json_output else None
-        messages = [{"role": "user", "content": prompt}]
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            response_format=output_json_structure
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        st.error(f"Error getting completion: {str(e)}")
-        return None
-
-# Alternative method to get completion by messages
-def get_completion_by_messages(messages, model="gpt-4", temperature=0, top_p=1.0, max_tokens=1024):
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        st.error(f"Error getting completion by messages: {str(e)}")
-        return None
-
-# Helper function to count tokens in text
-def count_tokens(text):
-    try:
-        encoding = tiktoken.encoding_for_model('gpt-4')
-        return len(encoding.encode(text))
-    except Exception as e:
-        st.error(f"Error counting tokens: {str(e)}")
-        return 0
-
-# Count tokens from a list of messages
-def count_tokens_from_message(messages):
-    try:
-        encoding = tiktoken.encoding_for_model('gpt-4')
-        value = ' '.join([x.get('content') for x in messages])
-        return len(encoding.encode(value))
-    except Exception as e:
-        st.error(f"Error counting message tokens: {str(e)}")
-        return 0
-
-# Define URLs to search for relevant information
-websites = [
-  "https://www.cpf.gov.sg/member/infohub/cpf-clarifies/policy-faqs/why-do-i-need-to-pay-interest-on-cpf-used-for-housing-after-property-sale",
+CPF_URLS = {
+    "housing_policies": [
+        "https://www.cpf.gov.sg/member/infohub/cpf-clarifies/policy-faqs/why-do-i-need-to-pay-interest-on-cpf-used-for-housing-after-property-sale",
 "https://www.cpf.gov.sg/member/infohub/news/news-releases/cpf-members-to-enjoy-lower-premiums-for-home-protection-insurance",
 "https://www.cpf.gov.sg/member/infohub/news/news-releases/cpf-members-to-enjoy-lower-premiums-for-home-protection-insurance-26-june-2018",
 "https://www.cpf.gov.sg/member/infohub/news/news-releases/over-760000-cpf-members-to-receive-premium-rebates-under-home-protection-scheme",
@@ -145,129 +75,176 @@ websites = [
 "https://www.cpf.gov.sg/employer/infohub/reports-and-statistics/cpf-statistics/home-ownership-statistics/cumulative-cpf-savings-withdrawn-for-housing",
 "https://www.cpf.gov.sg/employer/infohub/reports-and-statistics/cpf-statistics/home-ownership-statistics/home-protection-scheme-participation",
 "https://www.cpf.gov.sg/employer/infohub/reports-and-statistics/cpf-statistics/home-ownership-statistics/home-protection-scheme-claims",
-"https://www.cpf.gov.sg/employer/infohub/reports-and-statistics/cpf-trends/home-financing"
-]
+"https://www.cpf.gov.sg/employer/infohub/reports-and-statistics/cpf-trends/home-financing",
+    ],
+    "general_info": [
+        "https://www.cpf.gov.sg/"
+    ]
+}
 
-# Fetch webpage content
-def fetch_webpage_content(url):
+def identify_relevant_url(user_message, urls_dict=CPF_URLS):
+    relevant_urls = []
+    keywords = user_message.lower().split()
+    
+    for category, urls in urls_dict.items():
+        for url in urls:
+            if any(keyword in url.lower() for keyword in keywords):
+                relevant_urls.append(url)
+    
+    return relevant_urls if relevant_urls else urls_dict["general_info"]
+
+def fetch_webpage_content(url, timeout=10):
     try:
-        response = requests.get(url, timeout=10)
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=timeout)
         response.raise_for_status()
-        return response.text
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        for element in soup(['script', 'style', 'nav', 'footer']):
+            element.decompose()
+        
+        main_content = soup.find('main') or soup.find('article') or soup.find('div', {'class': ['content', 'main-content']})
+        return ' '.join(main_content.stripped_strings) if main_content else ' '.join(soup.stripped_strings)
+    
     except requests.RequestException as e:
         st.warning(f"Error fetching content from {url}: {str(e)}")
         return ""
 
-# Identify relevant URL based on user message
-def identify_relevant_url(user_message):
-    return [url for url in websites if user_message.lower() in url.lower()]
-
-# Get relevant content from URLs
 def get_relevant_content_from_urls(urls):
     content_list = []
     for url in urls:
         content = fetch_webpage_content(url)
         if content:
-            content_list.append({"url": url, "content": content})
+            cleaned_content = ' '.join(content.split())
+            max_length = 8000
+            if len(cleaned_content) > max_length:
+                cleaned_content = cleaned_content[:max_length] + "..."
+            content_list.append({"url": url, "content": cleaned_content})
     return content_list
 
-# Generate response based on content and append URL for reference
-def generate_response_based_on_content(user_message, content_list):
-    if not content_list:
-        return "I couldn't find relevant information for your query. Please try rephrasing your question."
+class CPFWebsiteSearchTool(WebsiteSearchTool):
+    def __init__(self):
+        super().__init__(CPF_URLS["housing_policies"][0])
+        self.all_urls = [url for urls in CPF_URLS.values() for url in urls]
     
-    delimiter = "####"
-    system_message = f"""
-    Using the relevant information extracted from the websites, \
-    answer the customer's question. Follow the query in the format below:
-
-    User Query: {delimiter}{user_message}{delimiter}
-    Website Content: {content_list}
-
-    Respond with the information relevant to the user query. Ensure \
-    responses are factually accurate and provide details useful for decision-making.
-    """
-    messages = [
-        {'role': 'system', 'content': system_message},
-        {'role': 'user', 'content': f"{delimiter}{user_message}{delimiter}"}
-    ]
-    response = get_completion_by_messages(messages)
-    
-    if response:
-        urls_used = [item["url"] for item in content_list]
-        urls_text = "\n".join([f"For more detailed information, please visit {url}" for url in urls_used])
-        return f"{response}\n\n{urls_text}"
-    else:
-        return "I apologize, but I encountered an error processing your request. Please try again."
-
-# Main function to process user message
-def process_user_message(user_input):
-    with st.spinner('Processing your query...'):
-        relevant_urls = identify_relevant_url(user_input)
-        if not relevant_urls:
-            return "I couldn't find any relevant information sources for your query. Please try rephrasing your question."
+    def search(self, query):
+        relevant_urls = identify_relevant_url(query)
+        content_list = get_relevant_content_from_urls(relevant_urls)
         
-        relevant_content = get_relevant_content_from_urls(relevant_urls)
-        return generate_response_based_on_content(user_input, relevant_content)
+        combined_content = "\n\n".join([f"Source: {item['url']}\n{item['content']}" for item in content_list])
+        return combined_content
 
-# Streamlit configuration and UI
-st.set_page_config(
-    layout="centered",
-    page_title="Unified Information Hub",
-    page_icon="🌐"
+tool_cpf_search = CPFWebsiteSearchTool()
+
+agent_researcher = Agent(
+    role="CPF Research Analyst",
+    goal="Conduct thorough research on CPF housing queries using official CPF sources",
+    backstory="You're a specialized researcher focusing on CPF housing policies and regulations. You verify information from official CPF sources.",
+    tools=[tool_cpf_search],
+    allow_delegation=False,
+    verbose=True
 )
 
-# Initialize session state for conversation history
+agent_advisor = Agent(
+    role="CPF Housing Advisor",
+    goal="Provide clear and accurate CPF housing advice",
+    backstory="You're an experienced CPF housing advisor who explains complex policies in simple terms.",
+    allow_delegation=False,
+    verbose=True
+)
+
+agent_writer = Agent(
+    role="Content Writer",
+    goal="Create clear and comprehensive responses to CPF housing queries",
+    backstory="You're a specialized writer who transforms complex CPF housing information into clear, concise responses.",
+    allow_delegation=False,
+    verbose=True
+)
+
+def create_crew_tasks(user_query):
+    task_research = Task(
+        description=f"Research the specific CPF housing query: {user_query}",
+        agent=agent_researcher,
+        async_execution=True
+    )
+
+    task_analyze = Task(
+        description=f"Analyze the research findings for the query: {user_query}",
+        agent=agent_advisor,
+        context=[task_research],
+        async_execution=True
+    )
+
+    task_write = Task(
+        description=f"Create a clear response to: {user_query}",
+        agent=agent_writer,
+        context=[task_research, task_analyze]
+    )
+
+    return [task_research, task_analyze, task_write]
+
+def process_crew_query(user_query):
+    tasks = create_crew_tasks(user_query)
+    crew = Crew(
+        agents=[agent_researcher, agent_advisor, agent_writer],
+        tasks=tasks,
+        verbose=True
+    )
+    return crew.kickoff()
+
+def process_user_message(user_input):
+    with st.spinner('Processing your query...'):
+        try:
+            crew_response = process_crew_query(user_input)
+            relevant_urls = identify_relevant_url(user_input)
+            traditional_response = ""
+            if relevant_urls:
+                relevant_content = get_relevant_content_from_urls(relevant_urls)
+                if relevant_content:
+                    traditional_response = "\n\n".join([f"{item['url']}: {item['content']}" for item in relevant_content])
+            
+            combined_response = f"### AI Analysis\n{crew_response}\n\n### Additional Information\n{traditional_response or 'No additional information found.'}"
+            return combined_response
+            
+        except Exception as e:
+            st.error(f"An error occurred while processing your query: {str(e)}")
+            return "I apologize, but I encountered an error while processing your request. Please try again."
+
+# Streamlit UI
+st.set_page_config(
+    layout="centered",
+    page_title="Enhanced CPF Housing Information Hub",
+    page_icon="🏠"
+)
+
 if 'conversation_history' not in st.session_state:
     st.session_state.conversation_history = []
 
-st.title("CPF Housing Information Hub")
+st.title("Enhanced CPF Housing Information Hub")
 
-# Information Section
-st.sidebar.header("About Us")
-st.sidebar.info("This application aggregates data from trusted sources from CPF Website to provide consolidated guidance. It personalizes responses based on the input query, enhancing user experience.")
+st.sidebar.header("About This Enhanced Version")
+st.sidebar.info("This upgraded version combines traditional information retrieval with AI-powered analysis using CrewAI.")
 
-st.sidebar.header("Methodology")
-st.sidebar.write(
-    """
-    Our approach involves gathering, analyzing, and providing insights by leveraging state-of-the-art language models and embedding techniques. All responses are sourced from reliable public repositories.
-    """
-)
+st.write("### Ask Your CPF Housing Question")
+st.write("Get comprehensive guidance powered by AI and official CPF sources:")
 
-# Streamlit form for user input
-st.write("### Ask Your Question")
-st.write("Get tailored guidance by entering your query below:")
-
-# Form for User Input
 with st.form(key="query_form"):
-    user_prompt = st.text_area(
-        "Enter your prompt here:",
-        height=100,
-        placeholder="e.g., Why do I need to pay interest on CPF used for housing after property sale?"
-    )
-    submit_button = st.form_submit_button("Submit")
+    user_prompt = st.text_area("Enter your question:", height=100, placeholder="e.g., How does CPF housing loan interest work?")
+    submit_button = st.form_submit_button("Get Answer")
 
     if submit_button and user_prompt:
         try:
             response = process_user_message(user_prompt)
-            
-            # Add to conversation history
-            st.session_state.conversation_history.append({
-                "question": user_prompt,
-                "answer": response
-            })
-            
+            st.session_state.conversation_history.append({"question": user_prompt, "answer": response})
         except Exception as e:
             st.error(f"An error occurred: {str(e)}")
 
-# Display conversation history
 if st.session_state.conversation_history:
     st.write("### Previous Questions and Answers")
     for item in reversed(st.session_state.conversation_history):
         with st.expander(f"Q: {item['question'][:100]}..."):
             st.write("Question:", item["question"])
-            st.write("Answer:", item["answer"])
+            st.markdown(item["answer"])
 
-# Footer
 st.write("---")
-st.caption("Powered by OpenAI and Streamlit")
+st.caption("Powered by OpenAI, CrewAI, and Streamlit")
