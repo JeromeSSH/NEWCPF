@@ -84,27 +84,53 @@ CPF_URLS = {
 
 def identify_relevant_url(user_message, urls_dict=CPF_URLS):
     relevant_urls = []
-    keywords = user_message.lower().split()
+    # Convert message to lowercase and create word list
+    message_words = set(user_message.lower().split())
     
-    for category, urls in urls_dict.items():
-        for url in urls:
-            if any(keyword in url.lower() for keyword in keywords):
-                relevant_urls.append(url)
+    # Define keywords for different categories
+    housing_keywords = {'housing', 'house', 'home', 'property', 'loan', 'interest', 'mortgage', 'hdb'}
     
-    return relevant_urls if relevant_urls else urls_dict["general_info"]
+    # Check if message contains housing-related keywords
+    if any(keyword in message_words for keyword in housing_keywords):
+        relevant_urls.extend(urls_dict["housing_policies"])
+    
+    # If no specific URLs found, include general info
+    if not relevant_urls:
+        relevant_urls.extend(urls_dict["general_info"])
+    
+    return relevant_urls
 
 def fetch_webpage_content(url, timeout=10):
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5'
+        }
         response = requests.get(url, headers=headers, timeout=timeout)
         response.raise_for_status()
         
         soup = BeautifulSoup(response.text, 'html.parser')
-        for element in soup(['script', 'style', 'nav', 'footer']):
+        
+        # Remove unwanted elements
+        for element in soup(['script', 'style', 'nav', 'footer', 'header', 'aside']):
             element.decompose()
         
-        main_content = soup.find('main') or soup.find('article') or soup.find('div', {'class': ['content', 'main-content']})
-        return ' '.join(main_content.stripped_strings) if main_content else ' '.join(soup.stripped_strings)
+        # Try to find main content area
+        content = None
+        for selector in ['main', 'article', '.content', '.main-content', '#content', '#main-content']:
+            content = soup.select_one(selector)
+            if content:
+                break
+        
+        if not content:
+            content = soup.find('div', {'role': 'main'}) or soup.body
+        
+        if content:
+            # Clean the content
+            text = ' '.join(p.get_text(strip=True) for p in content.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li']))
+            return text
+        return ""
     
     except requests.RequestException as e:
         st.warning(f"Error fetching content from {url}: {str(e)}")
@@ -115,10 +141,17 @@ def get_relevant_content_from_urls(urls):
     for url in urls:
         content = fetch_webpage_content(url)
         if content:
+            # Clean and format content
             cleaned_content = ' '.join(content.split())
+            # Limit content length while preserving complete sentences
             max_length = 8000
             if len(cleaned_content) > max_length:
-                cleaned_content = cleaned_content[:max_length] + "..."
+                # Find the last complete sentence before max_length
+                last_period = cleaned_content.rfind('.', 0, max_length)
+                if last_period != -1:
+                    cleaned_content = cleaned_content[:last_period + 1]
+                else:
+                    cleaned_content = cleaned_content[:max_length] + "..."
             content_list.append({"url": url, "content": cleaned_content})
     return content_list
 
@@ -131,8 +164,11 @@ class CPFWebsiteSearchTool(WebsiteSearchTool):
         relevant_urls = identify_relevant_url(query)
         content_list = get_relevant_content_from_urls(relevant_urls)
         
+        if not content_list:
+            return "No relevant information found. Please try refining your search."
+            
         combined_content = "\n\n".join([f"Source: {item['url']}\n{item['content']}" for item in content_list])
-        return combined_content
+        return combined_content[:50000]  # Limit total response size
 
 tool_cpf_search = CPFWebsiteSearchTool()
 
